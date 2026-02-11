@@ -1,1 +1,1 @@
-# COMP6258
+# COMP6258 Coursework: Distribution-Aware Group Quantisation of Diffusion Models
