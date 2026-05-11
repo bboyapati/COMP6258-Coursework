@@ -33,10 +33,21 @@ def main():
             m._quantize_weight(m.orig_linear.weight)
 
     print(f"Saving W4A16 intermediate state to {output_dir}...")
-    state_dict = {k: v.cpu().clone() for k, v in q_model.state_dict().items()}
-    save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
-    q_model.model.config.save_pretrained(output_dir)
+    # Pull the raw state dictionary (no extra memory used yet)
+    state_dict = q_model.state_dict()
+    clean_state_dict = {}
     
+    # Iterate and selectively clone ONLY the tied weight to appease safetensors
+    for k, v in tqdm(state_dict.items(), desc="Cleaning State Dict"):
+        if "lm_head.weight" in k:
+            clean_state_dict[k] = v.clone() # Allocates a tiny bit of RAM to break the tie
+        else:
+            clean_state_dict[k] = v # Passes by reference, ZERO extra RAM used
+
+    # Save to disk
+    save_file(clean_state_dict, os.path.join(output_dir, "model.safetensors"))
+    q_model.model.config.save_pretrained(output_dir)
+
     print("Weight Quantization Complete.")
 
 if __name__ == "__main__":

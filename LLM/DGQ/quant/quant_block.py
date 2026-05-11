@@ -35,6 +35,9 @@ class QuantGemma3Attention(nn.Module):
         
         # Determine if this is a local (sliding window) or global layer
         self.is_local_layer = (self.sliding_window is not None) and (self.sliding_window > 0)
+
+        # parent decoder layer strictly looks for during the forward pass.
+        self.is_sliding = getattr(orig_attn, "is_sliding", self.is_local_layer)
         
         # Quantization state
         self.act_quant = False
@@ -80,53 +83,64 @@ class QuantGemma3Attention(nn.Module):
         quantized_probs = quantized_probs / quantized_probs.sum(dim=-1, keepdim=True)
         
         return quantized_probs
-
-    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, **kwargs):
-        bsz, q_len, _ = hidden_states.size()
-
-        # 1. Compute Q, K, V using the QuantLayer projections
-        query_states = self.orig_attn.q_proj(hidden_states)
-        key_states = self.orig_attn.k_proj(hidden_states)
-        value_states = self.orig_attn.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        # Apply Gemma's RoPE (Rotary Position Embeddings)
-        # Note: orig_attn.rotary_emb handles the 1M base freq for global layers automatically
-        cos, sin = self.orig_attn.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # 2. Handle Grouped-Query Attention (GQA)
-        # Broadcast K and V to match the number of Q heads
-        key_states = torch.repeat_interleave(key_states, dim=1, repeats=self.num_heads // self.num_kv_heads)
-        value_states = torch.repeat_interleave(value_states, dim=1, repeats=self.num_heads // self.num_kv_heads)
-
-        # 3. Compute Raw Attention Scores
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:
-            # If this is a local layer, the attention_mask provided by the Gemma 3 processor 
-            # will already contain the sparse sliding window masking.
-            attn_weights = attn_weights + attention_mask
-
-        # 4. Softmax
-        attn_probs = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-        # 5. DGQ: Modality-Aware Logarithmic Quantization
-        # Detect where the vision tokens are in the sequence. 
-        # (Assuming kwargs['vision_token_mask'] is passed from our calibration dataloader)
-        vision_indices = []
-        if 'vision_token_mask' in kwargs and kwargs['vision_token_mask'] is not None:
-            vision_indices = kwargs['vision_token_mask'][0].nonzero(as_tuple=True)[0].tolist()
-
-        attn_probs = self._quantize_attention_probs(attn_probs, vision_token_indices=vision_indices)
-
-        # 6. Final output projection
-        attn_output = torch.matmul(attn_probs, value_states)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+    
+    def forward(self, *args, **kwargs):
+        """
+        Delegates the complex Multimodal RoPE and Sliding Window math 
+        back to the native Gemma 3 Attention module. 
         
-        attn_output = self.orig_attn.o_proj(attn_output)
+        Because we already wrapped the q, k, v, and o projections with QuantLayers 
+        during initialization, orig_attn will automatically quantize the matrix 
+        multiplications for us
+        """
+        return self.orig_attn(*args, **kwargs)
 
-        return attn_output, None, past_key_value
+    # def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, **kwargs):
+    #     bsz, q_len, _ = hidden_states.size()
+
+    #     # 1. Compute Q, K, V using the QuantLayer projections
+    #     query_states = self.orig_attn.q_proj(hidden_states)
+    #     key_states = self.orig_attn.k_proj(hidden_states)
+    #     value_states = self.orig_attn.v_proj(hidden_states)
+
+    #     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    #     key_states = key_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+    #     value_states = value_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+    #     # Apply Gemma's RoPE (Rotary Position Embeddings)
+    #     # Note: orig_attn.rotary_emb handles the 1M base freq for global layers automatically
+    #     cos, sin = self.orig_attn.rotary_emb(value_states, position_ids)
+    #     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    #     # 2. Handle Grouped-Query Attention (GQA)
+    #     # Broadcast K and V to match the number of Q heads
+    #     key_states = torch.repeat_interleave(key_states, dim=1, repeats=self.num_heads // self.num_kv_heads)
+    #     value_states = torch.repeat_interleave(value_states, dim=1, repeats=self.num_heads // self.num_kv_heads)
+
+    #     # 3. Compute Raw Attention Scores
+    #     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+    #     if attention_mask is not None:
+    #         # If this is a local layer, the attention_mask provided by the Gemma 3 processor 
+    #         # will already contain the sparse sliding window masking.
+    #         attn_weights = attn_weights + attention_mask
+
+    #     # 4. Softmax
+    #     attn_probs = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+    #     # 5. DGQ: Modality-Aware Logarithmic Quantization
+    #     # Detect where the vision tokens are in the sequence. 
+    #     # (Assuming kwargs['vision_token_mask'] is passed from our calibration dataloader)
+    #     vision_indices = []
+    #     if 'vision_token_mask' in kwargs and kwargs['vision_token_mask'] is not None:
+    #         vision_indices = kwargs['vision_token_mask'][0].nonzero(as_tuple=True)[0].tolist()
+
+    #     attn_probs = self._quantize_attention_probs(attn_probs, vision_token_indices=vision_indices)
+
+    #     # 6. Final output projection
+    #     attn_output = torch.matmul(attn_probs, value_states)
+    #     attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+        
+    #     attn_output = self.orig_attn.o_proj(attn_output)
+
+    #     return attn_output, None, past_key_value

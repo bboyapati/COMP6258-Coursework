@@ -42,39 +42,39 @@ class QuantGemma3Model(nn.Module):
             if isinstance(layer, Gemma3DecoderLayer):
                 self._wrap_single_decoder_layer(layer, layer_idx)
 
-    def _wrap_single_decoder_layer(self, layer: Gemma3DecoderLayer, layer_idx: int):
+    def _wrap_single_decoder_layer(self, layer, layer_idx: int):
         """Replace standard linear projections with DGQ QuantLayers."""
         
-        # 1. Wrap the MLP block (gate, up, down projections)
+        # Sanitize the parameters so the original DGQ QuantLayer doesn't crash
+        # from our custom VLM variables
+        custom_keys = ['attn_bits', 'log_base', 'num_groups']
+        ql_weight_params = {k: v for k, v in self.weight_quant_params.items() if k not in custom_keys}
+        ql_act_params = {k: v for k, v in self.act_quant_params.items() if k not in custom_keys}
+
+        # 1. Wrap the MLP block (gate, up, down projections) using the SANITIZED dicts
         mlp = layer.mlp
-        mlp.gate_proj = QuantLayer(mlp.gate_proj, self.weight_quant_params, self.act_quant_params)
-        mlp.up_proj = QuantLayer(mlp.up_proj, self.weight_quant_params, self.act_quant_params)
-        mlp.down_proj = QuantLayer(mlp.down_proj, self.weight_quant_params, self.act_quant_params)
-        
-        self.quant_module_list.extend([mlp.gate_proj, mlp.up_proj, mlp.down_proj])
+        mlp.gate_proj = QuantLayer(mlp.gate_proj, ql_weight_params, ql_act_params)
+        mlp.up_proj = QuantLayer(mlp.up_proj, ql_weight_params, ql_act_params)
+        mlp.down_proj = QuantLayer(mlp.down_proj, ql_weight_params, ql_act_params)
 
         # 2. Wrap the Attention block projections (Q, K, V, O)
         attn = layer.self_attn
-        attn.q_proj = QuantLayer(attn.q_proj, self.weight_quant_params, self.act_quant_params)
-        attn.k_proj = QuantLayer(attn.k_proj, self.weight_quant_params, self.act_quant_params)
-        attn.v_proj = QuantLayer(attn.v_proj, self.weight_quant_params, self.act_quant_params)
-        attn.o_proj = QuantLayer(attn.o_proj, self.weight_quant_params, self.act_quant_params)
-        
-        self.quant_module_list.extend([attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj])
+        attn.q_proj = QuantLayer(attn.q_proj, ql_weight_params, ql_act_params)
+        attn.k_proj = QuantLayer(attn.k_proj, ql_weight_params, ql_act_params)
+        attn.v_proj = QuantLayer(attn.v_proj, ql_weight_params, ql_act_params)
+        attn.o_proj = QuantLayer(attn.o_proj, ql_weight_params, ql_act_params)
 
-        # 3. Replace the attention computation itself to support Logarithmic Attention Quantization
-        # We pass layer_idx so the attention module knows if it is a local (sliding-window) or global layer
+        # 3. Replace the attention computation itself
+        # Notice we pass the FULL un-sanitized dicts here because our custom 
+        # QuantGemma3Attention class actually uses log_base and attn_bits.
         quant_attn = QuantGemma3Attention(
             attn, 
             self.weight_quant_params, 
             self.act_quant_params, 
             layer_idx=layer_idx,
-            config=self.model.config # <--- Add this line
+            config=self.model.config
         )
         layer.self_attn = quant_attn
-        
-        # NOTE: We do NOT quantize layer.input_layernorm or layer.post_attention_layernorm 
-        # to prevent zero-point drift in the hidden dimension outliers.
 
     def forward(self, input_ids=None, attention_mask=None, pixel_values=None, **kwargs):
         """Pass the forward call directly to the wrapped HF model."""

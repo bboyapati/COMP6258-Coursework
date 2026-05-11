@@ -70,7 +70,7 @@ def minmax(x: torch.Tensor,
         delta = 1e-8
     if type(x_min) == float: x_min = torch.tensor(x_min)
     zero_point = torch.round(-x_min / delta) if not (symmetric or always_zero) else 0
-    return torch.tensor(delta).type_as(x), zero_point
+    return delta.detach().clone().type_as(x), zero_point
 
 
 def logminmax(x: torch.Tensor,

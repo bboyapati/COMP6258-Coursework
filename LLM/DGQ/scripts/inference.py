@@ -10,11 +10,11 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("Loading Processor...")
-    processor = Gemma3Processor.from_pretrained("google/gemma-3-4b-it")
+    processor = Gemma3Processor.from_pretrained(model_id, use_fast=True)
 
     print("Loading Base Architecture...")
     base_model = Gemma3ForConditionalGeneration.from_pretrained(
-        final_model_dir, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
+        final_model_dir, dtype=torch.bfloat16, low_cpu_mem_usage=True
     )
 
     print("Applying DGQ Quantization Grids...")
