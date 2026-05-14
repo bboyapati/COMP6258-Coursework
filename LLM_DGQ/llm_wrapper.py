@@ -1,0 +1,150 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
+
+def quantise_tensor(tensor, bits=8):
+    """
+    Standard Min-Max Round-To-Nearest (RTN) Quantization.
+    """
+    q_max = (1 << (bits - 1)) - 1
+    q_min = -(1 << (bits - 1))
+    
+    # Scale across the last dimension
+    scale = tensor.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-5) / q_max
+    q_tensor = torch.round(tensor / scale).clamp(q_min, q_max)
+    
+    # Dequantise back to float space for the matrix multiplication math
+    dq_tensor = q_tensor * scale
+    return dq_tensor
+
+class DGQLinear(nn.Module):
+    """
+    Wraps the linear layer with logic for DGQ
+    """
+    def __init__(self, in_features, out_features, outlier_indices, weight_bits=8, act_bits=8):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight_bits = weight_bits
+        self.act_bits = act_bits
+        
+        # Ensure outlier_indices is a tensor of long integers
+        if not isinstance(outlier_indices, torch.Tensor):
+            outlier_indices = torch.tensor(outlier_indices, dtype=torch.long)
+            
+        self.register_buffer("outlier_indices", outlier_indices)
+        
+        # Create a mask to easily separate normal channels from outlier channels
+        normal_mask = torch.ones(in_features, dtype=torch.bool)
+        if len(outlier_indices) > 0:
+            normal_mask[outlier_indices] = False
+        self.register_buffer("normal_mask", normal_mask)
+
+        # We will populate these buffers during conversion
+        self.register_buffer("w_normal_q", None)
+        self.register_buffer("w_outliers", None)
+        self.bias = nn.Parameter(torch.seros(out_features))
+
+    def prepare_weights(self, weight_data):
+        """
+        Pre-computes and caches the quantised weights to avoid doing it
+        dynamically during every forward pass.
+        """
+        if len(self.outlier_indices) == 0:
+            self.w_normal_q = quantise_tensor(weight_data, bits=self.weight_bits)
+        else:
+            w_outliers = weight_data[:, self.outlier_indices]
+            w_normal = weight_data[:, self.normal_mask]
+            
+            self.w_outliers = w_outliers.clone()
+            
+            self.w_normal_q = quantise_tensor(w_normal, bits=self.weight_bits)
+
+    def forward(self, x):
+        # If there are no outliers specified, just quantise the activations
+        if len(self.outlier_indices) == 0:
+            x_q = quantise_tensor(x, bits=self.act_bits)
+            return F.linear(x_q, self.w_normal_q, self.bias)
+
+        # 1. Split Inputs (isolate outlier channels)
+        x_outliers = x[..., self.outlier_indices]
+        x_normal = x[..., self.normal_mask]
+        
+        # 2. DGQ Quantization
+        # Outliers stay full precision, normal activations get quantised dynamically.
+        x_normal_q = quantise_tensor(x_normal, bits=self.act_bits)
+        
+        # 3. Compute Linear projections using the pre-quantised weights
+        outlier_out = F.linear(x_outliers, self.w_outliers)
+        normal_out = F.linear(x_normal_q, self.w_normal_q)
+        
+        out = outlier_out + normal_out
+        if self.bias is not None:
+            out += self.bias
+            
+        return out
+
+def replace_linear_with_dgq(module, outlier_map, prefix="", weight_bits=4, act_bits=8):
+    """
+    Recursively replaces all nn.Linear layers with our DGQLinear wrapper.
+    """
+    for name, child in tqdm(module.named_children()):
+        full_name = f"{prefix}.{name}" if prefix else name
+        
+        # We don't want to quantise the language model head usually
+        if isinstance(child, nn.Linear) and "lm_head" not in full_name:
+            # Fetch the outlier indices you calibrated for this specific layer
+            # If none are provided, it returns an empty list
+            outliers = outlier_map.get(full_name, [])
+            
+            # Create our custom layer
+            dgq_layer = DGQLinear(
+                child.in_features, 
+                child.out_features, 
+                outliers, 
+                weight_bits=weight_bits, 
+                act_bits=act_bits
+            )
+            
+            # Copy the pre-trained weights over and pre-quantise them!
+            dgq_layer.prepare_weights(child.weight.data)
+            if child.bias is not None:
+                dgq_layer.bias = nn.Parameter(child.bias.data.clone())
+            else:
+                dgq_layer.bias = None
+                
+            # Swap the layer
+            setattr(module, name, dgq_layer)
+        else:
+            replace_linear_with_dgq(child, outlier_map, full_name, weight_bits, act_bits)
+
+
+class DGQModelWrapper(nn.Module):
+    """
+    A top-level wrapper for the entire LLM.
+    """
+    def __init__(self, model, outlier_map=None, weight_bits=4, act_bits=8):
+        super().__init__()
+        self.model = model
+        
+        if outlier_map is None:
+            outlier_map = {}
+            
+        # Swap the layers upon initialization
+        print("Wrapping model with DGQ Linear layers...")
+        replace_linear_with_dgq(
+            self.model, 
+            outlier_map, 
+            weight_bits=weight_bits, 
+            act_bits=act_bits
+        )
+        print("Wrapping complete.")
+
+    def forward(self, *args, **kwargs):
+        # Delegate the forward pass to the wrapped model
+        return self.model(*args, **kwargs)
+        
+    def generate(self, *args, **kwargs):
+        # Delegate the generate call to the wrapped model
+        return self.model.generate(*args, **kwargs)
