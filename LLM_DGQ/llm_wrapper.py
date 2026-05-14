@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+from transformers.cache_utils import DynamicCache
 
 def quantise_tensor(tensor, bits=8):
     """
@@ -17,6 +18,58 @@ def quantise_tensor(tensor, bits=8):
     # Dequantise back to float space for the matrix multiplication math
     dq_tensor = q_tensor * scale
     return dq_tensor
+
+
+class DGQKVCache(DynamicCache):
+    """
+    A custom KV-Cache that quantises cached key/value states to reduce memory
+    during autoregressive generation, while preserving attention sink tokens
+    (e.g. BOS) in full precision.
+    
+    Adapted from the DGQ paper's attention-aware quantisation principle.
+    """
+    def __init__(self, kv_bits=4, num_sink_tokens=1):
+        super().__init__()
+        self.kv_bits = kv_bits
+        self.num_sink_tokens = num_sink_tokens
+        self.key_cache = []
+        self.value_cache = []
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        """
+        Override the default cache update to quantise new KV entries.
+        
+        During the prefill phase (first call per layer), the sink tokens
+        are kept in full precision and the rest are quantised.
+        During the decode phase (subsequent calls), every new token's
+        KV entry is quantised before being appended.
+        """
+        if len(self.key_cache) <= layer_idx:
+            # Prefill phase: first update for this layer
+            seq_len = key_states.shape[-2]
+            
+            if seq_len > self.num_sink_tokens:
+                # Keep sink tokens (e.g. BOS) in full precision
+                sink_k = key_states[..., :self.num_sink_tokens, :]
+                rest_k = quantise_tensor(key_states[..., self.num_sink_tokens:, :], bits=self.kv_bits)
+                key_states = torch.cat([sink_k, rest_k], dim=-2)
+                
+                sink_v = value_states[..., :self.num_sink_tokens, :]
+                rest_v = quantise_tensor(value_states[..., self.num_sink_tokens:, :], bits=self.kv_bits)
+                value_states = torch.cat([sink_v, rest_v], dim=-2)
+            
+            # Store (sink tokens are already full precision, rest quantised)
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+        else:
+            # Decode phase: quantise the new token's KV and append
+            key_q = quantise_tensor(key_states, bits=self.kv_bits)
+            value_q = quantise_tensor(value_states, bits=self.kv_bits)
+            
+            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_q], dim=-2)
+            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_q], dim=-2)
+
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
 class DGQLinear(nn.Module):
     """
@@ -44,7 +97,7 @@ class DGQLinear(nn.Module):
         # We will populate these buffers during conversion
         self.register_buffer("w_normal_q", None)
         self.register_buffer("w_outliers", None)
-        self.bias = nn.Parameter(torch.seros(out_features))
+        self.bias = nn.Parameter(torch.zeros(out_features))
 
     def prepare_weights(self, weight_data):
         """
@@ -89,7 +142,7 @@ def replace_linear_with_dgq(module, outlier_map, prefix="", weight_bits=4, act_b
     """
     Recursively replaces all nn.Linear layers with our DGQLinear wrapper.
     """
-    for name, child in tqdm(module.named_children()):
+    for name, child in module.named_children():
         full_name = f"{prefix}.{name}" if prefix else name
         
         # We don't want to quantise the language model head usually
@@ -124,9 +177,13 @@ class DGQModelWrapper(nn.Module):
     """
     A top-level wrapper for the entire LLM.
     """
-    def __init__(self, model, outlier_map=None, weight_bits=4, act_bits=8):
+    def __init__(self, model, outlier_map=None, weight_bits=4, act_bits=8,
+                 quantise_kv_cache=False, kv_bits=4, num_sink_tokens=1):
         super().__init__()
         self.model = model
+        self.quantise_kv_cache = quantise_kv_cache
+        self.kv_bits = kv_bits
+        self.num_sink_tokens = num_sink_tokens
         
         if outlier_map is None:
             outlier_map = {}
@@ -140,11 +197,26 @@ class DGQModelWrapper(nn.Module):
             act_bits=act_bits
         )
         print("Wrapping complete.")
+        
+        if self.quantise_kv_cache:
+            print(f"KV-cache quantisation enabled: {kv_bits}-bit with {num_sink_tokens} sink token(s) in full precision.")
 
     def forward(self, *args, **kwargs):
         # Delegate the forward pass to the wrapped model
         return self.model(*args, **kwargs)
         
     def generate(self, *args, **kwargs):
-        # Delegate the generate call to the wrapped model
+        # If KV-cache quantisation is enabled, inject our custom cache
+        if self.quantise_kv_cache and 'past_key_values' not in kwargs:
+            kwargs['past_key_values'] = DGQKVCache(
+                kv_bits=self.kv_bits,
+                num_sink_tokens=self.num_sink_tokens
+            )
         return self.model.generate(*args, **kwargs)
+
+    def save_pretrained(self, save_directory, **kwargs):
+        """
+        Delegates the Hugging Face save_pretrained method to the underlying wrapped model.
+        This saves the quantized state_dict.
+        """
+        self.model.save_pretrained(save_directory, **kwargs)

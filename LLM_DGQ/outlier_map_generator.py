@@ -1,4 +1,6 @@
 import argparse
+import json
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,14 +32,12 @@ def get_outlier_channels(model, dataloader, outlier_fraction=0.01, device="cuda"
     # Store hooks so we can remove them later
     hooks = []
     
-    # Define the forward hook function
     def get_activation_hook(name):
         def hook(module, input, output):
             # input[0] shape: [batch_size, seq_len, in_features]
             x = input[0].detach()
             
             # Find the max absolute value across batch and sequence dimensions
-            # Resulting shape: [in_features]
             current_max = x.abs().max(dim=0)[0].max(dim=0)[0]
             
             if name not in channel_max_mags:
@@ -64,7 +64,11 @@ def get_outlier_channels(model, dataloader, outlier_fraction=0.01, device="cuda"
             }
             
             # Forward pass
-            model(**model_inputs)
+            outputs = model(**model_inputs, use_cache=False)
+            
+            # Explicitly delete tensors to prevent any reference lingering
+            del outputs
+            del model_inputs
             
     # Clean up hooks so the model returns to normal
     for hook in hooks:
@@ -93,15 +97,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="google/gemma-3-4b-it")
     parser.add_argument("--outlier_fraction", type=float, default=0.01)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--weight_bits", type=int, default=8)
-    parser.add_argument("--act_bits", type=int, default=8)
     args = parser.parse_args()
-    print("Quantising model: ", args.model_name, " with outlier fraction: ", args.outlier_fraction, " using batch size: ", args.batch_size, " on device: ", args.device)
+    print("Quantising model:", args.model_name, "with outlier fraction:", args.outlier_fraction, "using batch size:", args.batch_size, "on device:", args.device)
     
     print("Loading tokeniser and model...")
-    tokeniser = AutoTokeniser.from_pretrained(args.model_name)
+    tokeniser = AutoTokenizer.from_pretrained(args.model_name)
     # Ensure a pad token exists for batching
     if tokeniser.pad_token_id is None:
         tokeniser.pad_token = tokeniser.eos_token
@@ -114,18 +116,10 @@ def main():
     print("Finding outliers...")
     outlier_map = get_outlier_channels(model, dataloader, args.outlier_fraction, args.device)
 
-    print("Quantising model...")
-    quantised_model = DGQModelWrapper(
-        model, 
-        outlier_map, 
-        weight_bits=args.weight_bits, 
-        act_bits=args.act_bits
-    )
-
-    print("Saving quantised model...")
-    quantised_model.save_pretrained(f"{args.model_name}_quantised_w{args.weight_bits}_a{args.act_bits}")
-    tokeniser = AutoTokenizer.from_pretrained(args.model_name)
-    tokeniser.save_pretrained(f"{args.model_name}_quantised_w{args.weight_bits}_a{args.act_bits}")
+    outlier_map_path = f"outlier_map_{args.model_name.replace('/', '_')}.json"
+    with open(outlier_map_path, "w") as f:
+        json.dump(outlier_map, f)
+    print(f"Outlier map saved to {outlier_map_path}")
 
 if __name__ == "__main__":
     main()
