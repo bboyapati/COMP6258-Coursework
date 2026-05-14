@@ -69,8 +69,6 @@ def custom_collate_fn(batch, tokeniser=None):
             input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokeniser.pad_token_id)
             attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
         else:
-            # If no pad_token_id is set, you might want to handle it or let it fail
-            # depending on your specific requirements
             pass 
         
         return {
@@ -108,18 +106,3 @@ def get_mmlu_pro_dataloader(split="test", batch_size=8, tokeniser=None, num_work
         collate_fn=lambda b: custom_collate_fn(b, tokeniser)
     )
     return dataloader
-
-if __name__ == "__main__":
-    # Simple test script
-    # To run this you need to install `datasets`: pip install datasets
-    print("Loading raw MMLU-Pro dataloader (no tokeniser)...")
-    
-    # MMLU-Pro typically has 'validation' and 'test' splits
-    dataloader = get_mmlu_pro_dataloader(split="validation", batch_size=2, num_workers=0)
-    
-    for batch in dataloader:
-        print("Prompt Sample:", batch["prompt"][0])
-        print("Expected Answer:", batch["answer"][0])
-        print("Answer Index:", batch["answer_index"][0])
-        print("Category:", batch["category"][0])
-        break
