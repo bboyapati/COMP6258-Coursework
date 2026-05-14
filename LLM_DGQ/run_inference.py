@@ -27,7 +27,8 @@ def load_base_model(model_name: str, device: str):
 def load_quantised_model(model_name: str, outlier_map_path: str,
                          weight_bits: int, act_bits: int, device: str,
                          quantise_kv_cache: bool = False, kv_bits: int = 4,
-                         num_sink_tokens: int = 1):
+                         num_sink_tokens: int = 1,
+                         compile_model: bool = False):
     """
     Loads the base model and re-applies the DGQ wrapper using a previously
     saved outlier_map JSON. This perfectly recreates the quantised forward
@@ -57,6 +58,7 @@ def load_quantised_model(model_name: str, outlier_map_path: str,
         quantise_kv_cache=quantise_kv_cache,
         kv_bits=kv_bits,
         num_sink_tokens=num_sink_tokens,
+        compile_model=compile_model,
     )
     model.to(device)
     model.eval()
@@ -140,6 +142,8 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--do_sample", action="store_true")
+    parser.add_argument("--compile", action="store_true",
+                        help="Apply torch.compile() to the model for faster inference.")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -150,6 +154,7 @@ def main():
             quantise_kv_cache=args.quantise_kv_cache,
             kv_bits=args.kv_bits,
             num_sink_tokens=args.num_sink_tokens,
+            compile_model=args.compile,
         )
     else:
         print("No outlier map provided — running base model without quantisation.")

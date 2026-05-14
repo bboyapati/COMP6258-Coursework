@@ -94,49 +94,45 @@ class DGQLinear(nn.Module):
             normal_mask[outlier_indices] = False
         self.register_buffer("normal_mask", normal_mask)
 
-        # We will populate these buffers during conversion
-        self.register_buffer("w_normal_q", None)
-        self.register_buffer("w_outliers", None)
+        # We will populate this buffer during conversion
+        self.register_buffer("w_combined", None)
         self.bias = nn.Parameter(torch.zeros(out_features))
 
     def prepare_weights(self, weight_data):
         """
-        Pre-computes and caches the quantised weights to avoid doing it
-        dynamically during every forward pass.
+        Pre-computes and caches the combined weight matrix. Outlier columns
+        keep full-precision weights; normal columns are quantised. This is
+        done once so that forward() only needs a single matmul.
         """
         if len(self.outlier_indices) == 0:
-            self.w_normal_q = quantise_tensor(weight_data, bits=self.weight_bits)
+            # No outliers: quantise the entire weight matrix
+            self.w_combined = quantise_tensor(weight_data, bits=self.weight_bits)
         else:
-            w_outliers = weight_data[:, self.outlier_indices]
-            w_normal = weight_data[:, self.normal_mask]
-            
-            self.w_outliers = w_outliers.clone()
-            
-            self.w_normal_q = quantise_tensor(w_normal, bits=self.weight_bits)
+            # Build the combined weight matrix once
+            w = weight_data.clone()
+            # Quantise only the normal (non-outlier) columns
+            w[:, self.normal_mask] = quantise_tensor(
+                weight_data[:, self.normal_mask], bits=self.weight_bits
+            )
+            # Outlier columns remain as-is (full precision)
+            self.w_combined = w
 
     def forward(self, x):
-        # If there are no outliers specified, just quantise the activations
+        # Quantise only the normal activation channels; outlier channels
+        # stay in full precision (the DGQ principle).
         if len(self.outlier_indices) == 0:
             x_q = quantise_tensor(x, bits=self.act_bits)
-            return F.linear(x_q, self.w_normal_q, self.bias)
-
-        # 1. Split Inputs (isolate outlier channels)
-        x_outliers = x[..., self.outlier_indices]
-        x_normal = x[..., self.normal_mask]
-        
-        # 2. DGQ Quantization
-        # Outliers stay full precision, normal activations get quantised dynamically.
-        x_normal_q = quantise_tensor(x_normal, bits=self.act_bits)
-        
-        # 3. Compute Linear projections using the pre-quantised weights
-        outlier_out = F.linear(x_outliers, self.w_outliers)
-        normal_out = F.linear(x_normal_q, self.w_normal_q)
-        
-        out = outlier_out + normal_out
-        if self.bias is not None:
-            out += self.bias
+        else:
+            x_normal = torch.where(self.normal_mask, x, 0.0)
             
-        return out
+            q_max = (1 << (self.act_bits - 1)) - 1
+            q_min = -(1 << (self.act_bits - 1))
+            scale = x_normal.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-5) / q_max
+            
+            x_q_all = torch.round(x / scale).clamp(q_min, q_max) * scale
+            x_q = torch.where(self.normal_mask, x_q_all, x)
+            
+        return F.linear(x_q, self.w_combined, self.bias)
 
 def replace_linear_with_dgq(module, outlier_map, prefix="", weight_bits=4, act_bits=8):
     """
@@ -178,7 +174,8 @@ class DGQModelWrapper(nn.Module):
     A top-level wrapper for the entire LLM.
     """
     def __init__(self, model, outlier_map=None, weight_bits=4, act_bits=8,
-                 quantise_kv_cache=False, kv_bits=4, num_sink_tokens=1):
+                 quantise_kv_cache=False, kv_bits=4, num_sink_tokens=1,
+                 compile_model=False):
         super().__init__()
         self.model = model
         self.quantise_kv_cache = quantise_kv_cache
@@ -200,6 +197,11 @@ class DGQModelWrapper(nn.Module):
         
         if self.quantise_kv_cache:
             print(f"KV-cache quantisation enabled: {kv_bits}-bit with {num_sink_tokens} sink token(s) in full precision.")
+
+        if compile_model:
+            print("Compiling model with torch.compile()...")
+            self.model = torch.compile(self.model)
+            print("Compilation complete.")
 
     def forward(self, *args, **kwargs):
         # Delegate the forward pass to the wrapped model
