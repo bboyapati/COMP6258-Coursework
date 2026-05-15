@@ -1,0 +1,57 @@
+name: dgq_flux
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+
+  # PyTorch stack
+  - pytorch=2.5
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+
+  # Scientific stack
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - seaborn
+
+  - pip
+
+  - pip:
+      # HuggingFace ecosystem
+      - diffusers>=0.35.0
+      - transformers>=4.51.0
+      - accelerate>=1.2.0
+      - safetensors
+      - huggingface_hub>=0.30.0
+
+      # Flux / diffusion utilities
+      - sentencepiece
+      - protobuf
+      - einops
+      - peft
+
+      # Quantisation-related
+      - bitsandbytes
+      - optimum
+      - torchao
+
+      # Metrics
+      - torch-fidelity==0.3.0
+      - pytorch-fid==0.3.0
+      - image-reward
+
+      # Existing DGQ deps
+      - thop
+      - ptflops
+      - pytorch_lightning
+      - open_clip_torch
+
+      # Optional performance
+      - xformers
+
+      # Optional logging
+      - wandb
