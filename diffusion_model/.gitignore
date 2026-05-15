@@ -1,0 +1,8 @@
+results/
+temp*
+tmp*
+figures/
+figures*
+DGQ.egg-info/
+data/
+__pycache__/
