@@ -2,12 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers.cache_utils import DynamicCache
+from transformers.cache_utils import Cache, DynamicCache, DynamicLayer, CacheLayerMixin
 
 def quantise_tensor(tensor, bits=8):
-    """
-    Standard Min-Max Round-To-Nearest (RTN) Quantization.
-    """
     q_max = (1 << (bits - 1)) - 1
     q_min = -(1 << (bits - 1))
     
@@ -17,59 +14,76 @@ def quantise_tensor(tensor, bits=8):
     
     # Dequantise back to float space for the matrix multiplication math
     dq_tensor = q_tensor * scale
-    return dq_tensor
+    return dq_tensor.contiguous()
 
 
-class DGQKVCache(DynamicCache):
+class DGQDynamicLayer(DynamicLayer):
     """
-    A custom KV-Cache that quantises cached key/value states to reduce memory
-    during autoregressive generation, while preserving attention sink tokens
-    (e.g. BOS) in full precision.
-    
-    Adapted from the DGQ paper's attention-aware quantisation principle.
+    A single cache layer that quantises KV states on the fly, preserving
+    attention sink tokens (e.g. BOS) in full precision.
     """
     def __init__(self, kv_bits=4, num_sink_tokens=1):
         super().__init__()
         self.kv_bits = kv_bits
         self.num_sink_tokens = num_sink_tokens
-        self.key_cache = []
-        self.value_cache = []
+        self._prefill_done = False
 
-    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+    def update(self, key_states, value_states, *args, **kwargs):
         """
-        Override the default cache update to quantise new KV entries.
-        
-        During the prefill phase (first call per layer), the sink tokens
-        are kept in full precision and the rest are quantised.
-        During the decode phase (subsequent calls), every new token's
-        KV entry is quantised before being appended.
+        Quantise KV entries before caching. Sink tokens stay full-precision
+        during the initial prefill; all subsequent tokens are quantised.
         """
-        if len(self.key_cache) <= layer_idx:
-            # Prefill phase: first update for this layer
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+
+        if not self._prefill_done:
+            # Prefill phase
+            self._prefill_done = True
             seq_len = key_states.shape[-2]
-            
+
             if seq_len > self.num_sink_tokens:
-                # Keep sink tokens (e.g. BOS) in full precision
                 sink_k = key_states[..., :self.num_sink_tokens, :]
                 rest_k = quantise_tensor(key_states[..., self.num_sink_tokens:, :], bits=self.kv_bits)
                 key_states = torch.cat([sink_k, rest_k], dim=-2)
-                
+
                 sink_v = value_states[..., :self.num_sink_tokens, :]
                 rest_v = quantise_tensor(value_states[..., self.num_sink_tokens:, :], bits=self.kv_bits)
                 value_states = torch.cat([sink_v, rest_v], dim=-2)
-            
-            # Store (sink tokens are already full precision, rest quantised)
-            self.key_cache.append(key_states)
-            self.value_cache.append(value_states)
         else:
-            # Decode phase: quantise the new token's KV and append
-            key_q = quantise_tensor(key_states, bits=self.kv_bits)
-            value_q = quantise_tensor(value_states, bits=self.kv_bits)
-            
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_q], dim=-2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_q], dim=-2)
+            # Decode phase: quantise every new token
+            key_states = quantise_tensor(key_states, bits=self.kv_bits)
+            value_states = quantise_tensor(value_states, bits=self.kv_bits)
 
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        self.keys = torch.cat([self.keys, key_states], dim=-2)
+        self.values = torch.cat([self.values, value_states], dim=-2)
+        return self.keys, self.values
+
+
+class DGQKVCache(Cache):
+    """
+    A custom KV-Cache that quantises cached key/value states to reduce memory
+    during autoregressive generation, while preserving attention sink tokens
+    (e.g. BOS) in full precision.
+    
+    Compatible with the modern transformers Cache API (layer-based architecture).
+    Adapted from the DGQ paper's attention-aware quantisation principle.
+    """
+    def __init__(self, kv_bits=4, num_sink_tokens=1):
+        super().__init__(layers=[])
+        self.kv_bits = kv_bits
+        self.num_sink_tokens = num_sink_tokens
+
+    def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        """
+        Override to lazily create DGQDynamicLayer instances (with quantisation)
+        for each new layer, then delegate to the standard Cache.update() flow.
+        """
+        while len(self.layers) <= layer_idx:
+            self.layers.append(DGQDynamicLayer(
+                kv_bits=self.kv_bits,
+                num_sink_tokens=self.num_sink_tokens,
+            ))
+        return self.layers[layer_idx].update(key_states, value_states, *args, **kwargs)
 
 class DGQLinear(nn.Module):
     """
@@ -82,7 +96,6 @@ class DGQLinear(nn.Module):
         self.weight_bits = weight_bits
         self.act_bits = act_bits
         
-        # Ensure outlier_indices is a tensor of long integers
         if not isinstance(outlier_indices, torch.Tensor):
             outlier_indices = torch.tensor(outlier_indices, dtype=torch.long)
             
@@ -94,9 +107,8 @@ class DGQLinear(nn.Module):
             normal_mask[outlier_indices] = False
         self.register_buffer("normal_mask", normal_mask)
 
-        # We will populate this buffer during conversion
         self.register_buffer("w_combined", None)
-        self.bias = nn.Parameter(torch.zeros(out_features))
+        self.bias = None
 
     def prepare_weights(self, weight_data):
         """
@@ -106,7 +118,7 @@ class DGQLinear(nn.Module):
         """
         if len(self.outlier_indices) == 0:
             # No outliers: quantise the entire weight matrix
-            self.w_combined = quantise_tensor(weight_data, bits=self.weight_bits)
+            self.w_combined = quantise_tensor(weight_data, bits=self.weight_bits).contiguous()
         else:
             # Build the combined weight matrix once
             w = weight_data.clone()
@@ -115,7 +127,7 @@ class DGQLinear(nn.Module):
                 weight_data[:, self.normal_mask], bits=self.weight_bits
             )
             # Outlier columns remain as-is (full precision)
-            self.w_combined = w
+            self.w_combined = w.contiguous()
 
     def forward(self, x):
         # Quantise only the normal activation channels; outlier channels
@@ -132,7 +144,7 @@ class DGQLinear(nn.Module):
             x_q_all = torch.round(x / scale).clamp(q_min, q_max) * scale
             x_q = torch.where(self.normal_mask, x_q_all, x)
             
-        return F.linear(x_q, self.w_combined, self.bias)
+        return F.linear(x_q.contiguous(), self.w_combined.contiguous(), self.bias.contiguous() if self.bias is not None else None)
 
 def replace_linear_with_dgq(module, outlier_map, prefix="", weight_bits=4, act_bits=8):
     """
@@ -143,7 +155,6 @@ def replace_linear_with_dgq(module, outlier_map, prefix="", weight_bits=4, act_b
         
         # We don't want to quantise the language model head usually
         if isinstance(child, nn.Linear) and "lm_head" not in full_name:
-            # Fetch the outlier indices you calibrated for this specific layer
             # If none are provided, it returns an empty list
             outliers = outlier_map.get(full_name, [])
             
@@ -156,7 +167,7 @@ def replace_linear_with_dgq(module, outlier_map, prefix="", weight_bits=4, act_b
                 act_bits=act_bits
             )
             
-            # Copy the pre-trained weights over and pre-quantise them!
+            # Copy the pre-trained weights over and pre-quantise them
             dgq_layer.prepare_weights(child.weight.data)
             if child.bias is not None:
                 dgq_layer.bias = nn.Parameter(child.bias.data.clone())
@@ -164,6 +175,7 @@ def replace_linear_with_dgq(module, outlier_map, prefix="", weight_bits=4, act_b
                 dgq_layer.bias = None
                 
             # Swap the layer
+            print(f"Replacing {full_name} with DGQLinear (weight_bits={weight_bits}, act_bits={act_bits}, outliers={len(outliers)})")
             setattr(module, name, dgq_layer)
         else:
             replace_linear_with_dgq(child, outlier_map, full_name, weight_bits, act_bits)
@@ -208,7 +220,6 @@ class DGQModelWrapper(nn.Module):
         return self.model(*args, **kwargs)
         
     def generate(self, *args, **kwargs):
-        # If KV-cache quantisation is enabled, inject our custom cache
         if self.quantise_kv_cache and 'past_key_values' not in kwargs:
             kwargs['past_key_values'] = DGQKVCache(
                 kv_bits=self.kv_bits,

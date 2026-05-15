@@ -34,7 +34,6 @@ def get_outlier_channels(model, dataloader, outlier_fraction=0.01, device="cuda"
     
     def get_activation_hook(name):
         def hook(module, input, output):
-            # input[0] shape: [batch_size, seq_len, in_features]
             x = input[0].detach()
             
             # Find the max absolute value across batch and sequence dimensions
@@ -43,7 +42,6 @@ def get_outlier_channels(model, dataloader, outlier_fraction=0.01, device="cuda"
             if name not in channel_max_mags:
                 channel_max_mags[name] = current_max
             else:
-                # Update the running maximum
                 channel_max_mags[name] = torch.maximum(channel_max_mags[name], current_max)
         return hook
 
@@ -57,13 +55,11 @@ def get_outlier_channels(model, dataloader, outlier_fraction=0.01, device="cuda"
     print(f"Running {len(dataloader)} batches for calibration...")
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Calibrating"):
-            # Extract only the inputs the model expects and move to device
             model_inputs = {
                 "input_ids": batch["input_ids"].to(device),
                 "attention_mask": batch["attention_mask"].to(device)
             }
             
-            # Forward pass
             outputs = model(**model_inputs, use_cache=False)
             
             # Explicitly delete tensors to prevent any reference lingering
@@ -87,7 +83,6 @@ def get_outlier_channels(model, dataloader, outlier_fraction=0.01, device="cuda"
         # Get the indices of the channels with the highest magnitudes
         _, topk_indices = torch.topk(max_mags, k=num_outliers)
         
-        # Convert to a standard Python list
         outlier_map[name] = topk_indices.cpu().tolist()
         
     print(f"Calibration complete! Found outliers for {len(outlier_map)} layers.")
@@ -104,7 +99,6 @@ def main():
     
     print("Loading tokeniser and model...")
     tokeniser = AutoTokenizer.from_pretrained(args.model_name)
-    # Ensure a pad token exists for batching
     if tokeniser.pad_token_id is None:
         tokeniser.pad_token = tokeniser.eos_token
         

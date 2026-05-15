@@ -1,5 +1,6 @@
 import argparse
 import json
+import time
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from llm_wrapper import DGQModelWrapper
@@ -83,6 +84,8 @@ def run_inference(model, tokeniser, prompt: str, device: str,
         vram_before = torch.cuda.memory_allocated() / 1e9
         torch.cuda.reset_peak_memory_stats()
 
+    start_time = time.time()
+
     output_ids = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
@@ -91,11 +94,18 @@ def run_inference(model, tokeniser, prompt: str, device: str,
         pad_token_id=tokeniser.pad_token_id,
     )
 
+    if device == "cuda":
+        torch.cuda.synchronize()
+
+    end_time = time.time()
+    generation_time = end_time - start_time
+
     # Measure VRAM after generation (includes KV-cache + activations peak)
     vram_stats = {}
     num_generated = output_ids.shape[-1] - prompt_len
+    tokens_per_second = num_generated / generation_time if generation_time > 0 else 0
+
     if device == "cuda":
-        torch.cuda.synchronize()
         vram_after = torch.cuda.memory_allocated() / 1e9
         vram_peak = torch.cuda.max_memory_allocated() / 1e9
         vram_stats = {
@@ -104,11 +114,15 @@ def run_inference(model, tokeniser, prompt: str, device: str,
             "generation_overhead_gb": round(vram_peak - vram_before, 2),
             "prompt_tokens": prompt_len,
             "generated_tokens": num_generated,
+            "generation_time_s": generation_time,
+            "tokens_per_second": tokens_per_second,
         }
     else:
         vram_stats = {
             "prompt_tokens": prompt_len,
             "generated_tokens": num_generated,
+            "generation_time_s": generation_time,
+            "tokens_per_second": tokens_per_second,
         }
 
     decoded = tokeniser.decode(output_ids[0], skip_special_tokens=True)
@@ -178,6 +192,9 @@ def main():
         print(f"\n--- Generation Stats ---")
         print(f"Prompt tokens:           {vram_stats['prompt_tokens']}")
         print(f"Generated tokens:        {vram_stats['generated_tokens']}")
+        if 'generation_time_s' in vram_stats:
+            print(f"Time taken:              {vram_stats['generation_time_s']:.2f} s")
+            print(f"Generation speed:        {vram_stats['tokens_per_second']:.2f} tokens/s")
         if 'model_vram_gb' in vram_stats:
             print(f"Model loaded:            {vram_stats['model_vram_gb']:.2f} GB")
             print(f"Peak during generation:  {vram_stats['peak_vram_gb']:.2f} GB")

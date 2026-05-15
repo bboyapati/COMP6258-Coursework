@@ -96,8 +96,7 @@ def get_mmlu_pro_dataloader(split="test", batch_size=8, tokeniser=None, num_work
     Creates and returns a PyTorch DataLoader for the MMLU-Pro dataset.
     """
     dataset = MMLUProDataset(split=split, tokeniser=tokeniser)
-    
-    # We use a lambda to pass the tokeniser into the collate_fn
+
     dataloader = DataLoader(
         dataset, 
         batch_size=batch_size, 
